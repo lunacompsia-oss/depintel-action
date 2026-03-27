@@ -1,5 +1,5 @@
 name: 'DepIntel — Dependency Intelligence'
-description: 'Analyze PR dependency changes for vulnerabilities, licenses, and breaking changes. Powered by depintel-api.'
+description: 'Analyze PR dependency changes for vulnerabilities, licenses, and breaking changes. Supports npm and Python (PyPI). Powered by depintel-api.'
 author: 'lunacompsia-oss'
 
 branding:
@@ -44,58 +44,118 @@ runs:
           BASE_SHA="HEAD~1"
         fi
 
-        # Find package.json files that changed
-        CHANGED_FILES=$(git diff --name-only "$BASE_SHA" HEAD -- '**/package.json' 'package.json' 2>/dev/null || echo "")
+        # Initialize deps array: each entry is {"name":"pkg","ecosystem":"npm|PyPI"}
+        DEPS_JSON="[]"
 
-        if [ -z "$CHANGED_FILES" ]; then
-          echo "No package.json changes detected."
+        # ── npm: package.json ──
+        CHANGED_NPM=$(git diff --name-only "$BASE_SHA" HEAD -- '**/package.json' 'package.json' 2>/dev/null || echo "")
+
+        if [ -n "$CHANGED_NPM" ]; then
+          echo "Changed package.json files:"
+          echo "$CHANGED_NPM"
+
+          for FILE in $CHANGED_NPM; do
+            if [ ! -f "$FILE" ]; then continue; fi
+
+            OLD_DEPS=$(git show "$BASE_SHA:$FILE" 2>/dev/null | jq -r '.dependencies // {} | to_entries[] | "\(.key)@\(.value)"' 2>/dev/null || echo "")
+            OLD_DEV=$(git show "$BASE_SHA:$FILE" 2>/dev/null | jq -r '.devDependencies // {} | to_entries[] | "\(.key)@\(.value)"' 2>/dev/null || echo "")
+            NEW_DEPS=$(jq -r '.dependencies // {} | to_entries[] | "\(.key)@\(.value)"' "$FILE" 2>/dev/null || echo "")
+            NEW_DEV=$(jq -r '.devDependencies // {} | to_entries[] | "\(.key)@\(.value)"' "$FILE" 2>/dev/null || echo "")
+
+            ALL_OLD=$(echo -e "${OLD_DEPS}\n${OLD_DEV}" | sort | grep -v '^$' || true)
+            ALL_NEW=$(echo -e "${NEW_DEPS}\n${NEW_DEV}" | sort | grep -v '^$' || true)
+            CHANGED_DEPS=$(comm -13 <(echo "$ALL_OLD") <(echo "$ALL_NEW") 2>/dev/null || echo "")
+
+            if [ -n "$CHANGED_DEPS" ]; then
+              while IFS= read -r dep; do
+                if [[ "$dep" == @* ]]; then
+                  PKG_NAME=$(echo "$dep" | sed 's/\(^@[^/]*\/[^@]*\)@.*/\1/')
+                else
+                  PKG_NAME=$(echo "$dep" | sed 's/@[^@]*$//')
+                fi
+                DEPS_JSON=$(echo "$DEPS_JSON" | jq --arg pkg "$PKG_NAME" '. + [{"name":$pkg,"ecosystem":"npm"}]' 2>/dev/null)
+              done <<< "$CHANGED_DEPS"
+            fi
+          done
+        fi
+
+        # ── Python: requirements.txt ──
+        CHANGED_REQS=$(git diff --name-only "$BASE_SHA" HEAD -- '**/requirements*.txt' 'requirements*.txt' 2>/dev/null || echo "")
+
+        if [ -n "$CHANGED_REQS" ]; then
+          echo "Changed requirements files:"
+          echo "$CHANGED_REQS"
+
+          for FILE in $CHANGED_REQS; do
+            if [ ! -f "$FILE" ]; then continue; fi
+
+            # Parse: strip comments, blank lines, options; extract "pkg==ver" or "pkg>=ver" etc.
+            OLD_PKGS=$(git show "$BASE_SHA:$FILE" 2>/dev/null | grep -v '^\s*#' | grep -v '^\s*$' | grep -v '^\s*-' | sed 's/\s*#.*//' | sort || echo "")
+            NEW_PKGS=$(grep -v '^\s*#' "$FILE" | grep -v '^\s*$' | grep -v '^\s*-' | sed 's/\s*#.*//' | sort || echo "")
+
+            CHANGED_PY=$(comm -13 <(echo "$OLD_PKGS") <(echo "$NEW_PKGS") 2>/dev/null || echo "")
+
+            if [ -n "$CHANGED_PY" ]; then
+              while IFS= read -r line; do
+                # Extract package name (before any version specifier)
+                PKG_NAME=$(echo "$line" | sed 's/[>=<!=~].*//' | sed 's/\[.*\]//' | xargs)
+                if [ -n "$PKG_NAME" ]; then
+                  DEPS_JSON=$(echo "$DEPS_JSON" | jq --arg pkg "$PKG_NAME" '. + [{"name":$pkg,"ecosystem":"PyPI"}]' 2>/dev/null)
+                fi
+              done <<< "$CHANGED_PY"
+            fi
+          done
+        fi
+
+        # ── Python: pyproject.toml ──
+        CHANGED_PYPROJ=$(git diff --name-only "$BASE_SHA" HEAD -- '**/pyproject.toml' 'pyproject.toml' 2>/dev/null || echo "")
+
+        if [ -n "$CHANGED_PYPROJ" ]; then
+          echo "Changed pyproject.toml files:"
+          echo "$CHANGED_PYPROJ"
+
+          for FILE in $CHANGED_PYPROJ; do
+            if [ ! -f "$FILE" ]; then continue; fi
+
+            # Extract dependency names from [project.dependencies] and [project.optional-dependencies]
+            # Format: "package>=1.0" or "package[extra]>=1.0" inside arrays
+            OLD_CONTENT=$(git show "$BASE_SHA:$FILE" 2>/dev/null || echo "")
+            NEW_CONTENT=$(cat "$FILE")
+
+            # Extract quoted strings that look like deps from dependencies arrays
+            OLD_PY=$(echo "$OLD_CONTENT" | grep -oE '"[a-zA-Z0-9_-]+(\[[^\]]*\])?\s*[>=<!=~][^"]*"' | sed 's/"//g' | sed 's/[>=<!=~].*//' | sed 's/\[.*\]//' | sort -u || echo "")
+            NEW_PY=$(echo "$NEW_CONTENT" | grep -oE '"[a-zA-Z0-9_-]+(\[[^\]]*\])?\s*[>=<!=~][^"]*"' | sed 's/"//g' | sed 's/[>=<!=~].*//' | sed 's/\[.*\]//' | sort -u || echo "")
+
+            # Also catch bare quoted package names: "package"
+            OLD_BARE=$(echo "$OLD_CONTENT" | grep -oE '"[a-zA-Z0-9_-]+"' | sed 's/"//g' | sort -u || echo "")
+            NEW_BARE=$(echo "$NEW_CONTENT" | grep -oE '"[a-zA-Z0-9_-]+"' | sed 's/"//g' | sort -u || echo "")
+
+            ALL_OLD_PY=$(echo -e "${OLD_PY}\n${OLD_BARE}" | sort -u | grep -v '^$' || true)
+            ALL_NEW_PY=$(echo -e "${NEW_PY}\n${NEW_BARE}" | sort -u | grep -v '^$' || true)
+
+            CHANGED_PYPROJ_DEPS=$(comm -13 <(echo "$ALL_OLD_PY") <(echo "$ALL_NEW_PY") 2>/dev/null || echo "")
+
+            if [ -n "$CHANGED_PYPROJ_DEPS" ]; then
+              while IFS= read -r pkg; do
+                if [ -n "$pkg" ]; then
+                  DEPS_JSON=$(echo "$DEPS_JSON" | jq --arg pkg "$pkg" '. + [{"name":$pkg,"ecosystem":"PyPI"}]' 2>/dev/null)
+                fi
+              done <<< "$CHANGED_PYPROJ_DEPS"
+            fi
+          done
+        fi
+
+        # Deduplicate by name+ecosystem
+        DEPS_JSON=$(echo "$DEPS_JSON" | jq 'unique_by(.name + .ecosystem)')
+        COUNT=$(echo "$DEPS_JSON" | jq 'length')
+
+        if [ "$COUNT" -eq 0 ]; then
+          echo "No dependency changes detected."
           echo "changed=false" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
-        echo "Changed package.json files:"
-        echo "$CHANGED_FILES"
         echo "changed=true" >> "$GITHUB_OUTPUT"
-
-        # Extract added/changed dependencies
-        DEPS_JSON="[]"
-
-        for FILE in $CHANGED_FILES; do
-          if [ ! -f "$FILE" ]; then
-            continue
-          fi
-
-          # Get old and new versions of the file
-          OLD_DEPS=$(git show "$BASE_SHA:$FILE" 2>/dev/null | jq -r '.dependencies // {} | to_entries[] | "\(.key)@\(.value)"' 2>/dev/null || echo "")
-          OLD_DEV=$(git show "$BASE_SHA:$FILE" 2>/dev/null | jq -r '.devDependencies // {} | to_entries[] | "\(.key)@\(.value)"' 2>/dev/null || echo "")
-          NEW_DEPS=$(jq -r '.dependencies // {} | to_entries[] | "\(.key)@\(.value)"' "$FILE" 2>/dev/null || echo "")
-          NEW_DEV=$(jq -r '.devDependencies // {} | to_entries[] | "\(.key)@\(.value)"' "$FILE" 2>/dev/null || echo "")
-
-          # Find new or changed deps (in new but not in old, or version changed)
-          ALL_OLD=$(echo -e "${OLD_DEPS}\n${OLD_DEV}" | sort | grep -v '^$' || true)
-          ALL_NEW=$(echo -e "${NEW_DEPS}\n${NEW_DEV}" | sort | grep -v '^$' || true)
-
-          # Deps that are new or changed
-          CHANGED_DEPS=$(comm -13 <(echo "$ALL_OLD") <(echo "$ALL_NEW") 2>/dev/null || echo "")
-
-          if [ -n "$CHANGED_DEPS" ]; then
-            while IFS= read -r dep; do
-              PKG_NAME=$(echo "$dep" | sed 's/@[^^]*$//' | sed 's/^\(.*\)@.*$/\1/')
-              # Handle scoped packages
-              if [[ "$dep" == @* ]]; then
-                PKG_NAME=$(echo "$dep" | sed 's/\(^@[^/]*\/[^@]*\)@.*/\1/')
-              else
-                PKG_NAME=$(echo "$dep" | sed 's/@[^@]*$//')
-              fi
-              DEPS_JSON=$(echo "$DEPS_JSON" | jq --arg pkg "$PKG_NAME" '. + [$pkg]' 2>/dev/null)
-            done <<< "$CHANGED_DEPS"
-          fi
-        done
-
-        # Deduplicate
-        DEPS_JSON=$(echo "$DEPS_JSON" | jq 'unique')
-        COUNT=$(echo "$DEPS_JSON" | jq 'length')
-
         echo "Found $COUNT changed/new dependencies"
         echo "$DEPS_JSON" > /tmp/depintel-changed-deps.json
         echo "count=$COUNT" >> "$GITHUB_OUTPUT"
@@ -118,15 +178,16 @@ runs:
         REPORT='{"dependencies":[],"summary":{"total":0,"vulnerabilities":0,"high_risk_licenses":0}}'
 
         for i in $(seq 0 $((COUNT - 1))); do
-          PKG=$(echo "$DEPS" | jq -r ".[$i]")
-          echo "Analyzing: $PKG"
+          PKG=$(echo "$DEPS" | jq -r ".[$i].name")
+          ECO=$(echo "$DEPS" | jq -r ".[$i].ecosystem")
+          echo "Analyzing: $PKG ($ECO)"
 
-          # Fetch vulnerability data
-          VULN_DATA=$(curl -sf "${API_URL}/api/vulnerabilities?package=${PKG}" 2>/dev/null || echo '{"count":0,"vulnerabilities":[]}')
+          # Fetch vulnerability data (pass ecosystem for correct OSV.dev lookup)
+          VULN_DATA=$(curl -sf "${API_URL}/api/vulnerabilities?package=${PKG}&ecosystem=${ECO}" 2>/dev/null || echo '{"count":0,"vulnerabilities":[]}')
           VULN_COUNT=$(echo "$VULN_DATA" | jq '.count // 0')
 
-          # Fetch license data
-          LICENSE_DATA=$(curl -sf "${API_URL}/api/license?package=${PKG}" 2>/dev/null || echo '{"license":"unknown","risk":"unknown"}')
+          # Fetch license data (pass ecosystem for correct registry lookup)
+          LICENSE_DATA=$(curl -sf "${API_URL}/api/license?package=${PKG}&ecosystem=${ECO}" 2>/dev/null || echo '{"license":"unknown","risk":"unknown"}')
           LICENSE=$(echo "$LICENSE_DATA" | jq -r '.license // "unknown"')
           RISK=$(echo "$LICENSE_DATA" | jq -r '.risk // "unknown"')
 
@@ -141,12 +202,13 @@ runs:
           # Build dep entry
           DEP_ENTRY=$(jq -n \
             --arg pkg "$PKG" \
+            --arg eco "$ECO" \
             --arg license "$LICENSE" \
             --arg risk "$RISK" \
             --argjson vulns "$VULN_COUNT" \
             --argjson vuln_data "$VULN_DATA" \
             --argjson license_data "$LICENSE_DATA" \
-            '{package: $pkg, license: $license, license_risk: $risk, vulnerability_count: $vulns, vulnerabilities: $vuln_data.vulnerabilities, license_details: $license_data}')
+            '{package: $pkg, ecosystem: $eco, license: $license, license_risk: $risk, vulnerability_count: $vulns, vulnerabilities: $vuln_data.vulnerabilities, license_details: $license_data}')
 
           REPORT=$(echo "$REPORT" | jq \
             --argjson dep "$DEP_ENTRY" \
@@ -187,12 +249,13 @@ runs:
 
         if [ "$DEP_COUNT" -gt 0 ]; then
           COMMENT+="### Details\n\n"
-          COMMENT+="| Package | License | Risk | Vulnerabilities |\n"
-          COMMENT+="|---------|---------|------|-----------------|\n"
+          COMMENT+="| Package | Ecosystem | License | Risk | Vulnerabilities |\n"
+          COMMENT+="|---------|-----------|---------|------|-----------------|\n"
 
           for i in $(seq 0 $((DEP_COUNT - 1))); do
             DEP=$(echo "$REPORT" | jq ".dependencies[$i]")
             PKG=$(echo "$DEP" | jq -r '.package')
+            ECO=$(echo "$DEP" | jq -r '.ecosystem // "npm"')
             LIC=$(echo "$DEP" | jq -r '.license')
             RISK=$(echo "$DEP" | jq -r '.license_risk')
             VC=$(echo "$DEP" | jq '.vulnerability_count')
@@ -212,7 +275,7 @@ runs:
               VULN_ICON=":warning: ${VC}"
             fi
 
-            COMMENT+="| \`${PKG}\` | ${LIC} | ${RISK_ICON} | ${VULN_ICON} |\n"
+            COMMENT+="| \`${PKG}\` | ${ECO} | ${LIC} | ${RISK_ICON} | ${VULN_ICON} |\n"
           done
 
           # Vulnerability details (if any)
