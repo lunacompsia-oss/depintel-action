@@ -2,16 +2,25 @@
 
 Automatically analyze dependency changes in your pull requests for **vulnerabilities**, **license risks**, and **breaking changes**.
 
+Supports **npm** (package.json) and **Python** (requirements.txt, pyproject.toml).
+
 Powered by the [DepIntel API](https://depintel-api.pingbase-api.workers.dev) — free dependency intelligence.
 
 ## What it does
 
-When a PR modifies `package.json`, this action:
+When a PR modifies dependency files (`package.json`, `requirements.txt`, or `pyproject.toml`), this action:
 
 1. Detects which dependencies were added or changed
 2. Checks each dependency for known vulnerabilities (via [OSV.dev](https://osv.dev))
 3. Analyzes license type and risk level
 4. Posts a summary comment on the PR
+
+## Supported Ecosystems
+
+| Ecosystem | Files Detected | Registry |
+|-----------|---------------|----------|
+| **npm** | `package.json` | npmjs.org |
+| **PyPI** | `requirements.txt`, `requirements-*.txt`, `pyproject.toml` | pypi.org |
 
 ## Usage
 
@@ -21,6 +30,8 @@ on:
   pull_request:
     paths:
       - '**/package.json'
+      - '**/requirements*.txt'
+      - '**/pyproject.toml'
 
 jobs:
   depintel:
@@ -58,10 +69,11 @@ jobs:
 | Vulnerabilities found | **2** |
 | High-risk licenses | **0** |
 
-| Package | License | Risk | Vulnerabilities |
-|---------|---------|------|-----------------|
-| `express` | MIT | :white_check_mark: low | :white_check_mark: 0 |
-| `lodash` | MIT | :white_check_mark: low | :warning: 2 |
+| Package | Ecosystem | License | Risk | Vulnerabilities |
+|---------|-----------|---------|------|-----------------|
+| `express` | npm | MIT | :white_check_mark: low | :white_check_mark: 0 |
+| `lodash` | npm | MIT | :white_check_mark: low | :warning: 2 |
+| `requests` | PyPI | Apache-2.0 | :white_check_mark: low | :warning: 13 |
 
 ## Advanced: Fail on vulnerabilities
 
