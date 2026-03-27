@@ -71,6 +71,22 @@ jobs:
     fail-on-critical: 'true'
 ```
 
+## Badge
+
+Add a "Scanned by DepIntel" badge to your README:
+
+```md
+![DepIntel](https://depintel-api.pingbase-api.workers.dev/badge)
+```
+
+Status-specific badges are also available:
+
+```md
+![DepIntel Passing](https://depintel-api.pingbase-api.workers.dev/badge/passing)
+![DepIntel Failing](https://depintel-api.pingbase-api.workers.dev/badge/failing)
+![DepIntel Unknown](https://depintel-api.pingbase-api.workers.dev/badge/unknown)
+```
+
 ## License
 
 MIT
