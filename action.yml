@@ -1,0 +1,269 @@
+name: 'DepIntel — Dependency Intelligence'
+description: 'Analyze PR dependency changes for vulnerabilities, licenses, and breaking changes. Powered by depintel-api.'
+author: 'lunacompsia-oss'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  github-token:
+    description: 'GitHub token for posting PR comments'
+    required: false
+    default: ${{ github.token }}
+  api-url:
+    description: 'DepIntel API base URL'
+    required: false
+    default: 'https://depintel-api.pingbase-api.workers.dev'
+  fail-on-critical:
+    description: 'Fail the action if critical vulnerabilities are found'
+    required: false
+    default: 'false'
+
+outputs:
+  vulnerabilities-found:
+    description: 'Number of vulnerabilities found across all changed dependencies'
+    value: ${{ steps.analyze.outputs.vulns }}
+  report:
+    description: 'Path to the full JSON report'
+    value: ${{ steps.analyze.outputs.report }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Detect dependency changes
+      id: detect
+      shell: bash
+      run: |
+        echo "::group::Detecting dependency changes"
+
+        # Get the base ref for comparison
+        if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+        else
+          BASE_SHA="HEAD~1"
+        fi
+
+        # Find package.json files that changed
+        CHANGED_FILES=$(git diff --name-only "$BASE_SHA" HEAD -- '**/package.json' 'package.json' 2>/dev/null || echo "")
+
+        if [ -z "$CHANGED_FILES" ]; then
+          echo "No package.json changes detected."
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "Changed package.json files:"
+        echo "$CHANGED_FILES"
+        echo "changed=true" >> "$GITHUB_OUTPUT"
+
+        # Extract added/changed dependencies
+        DEPS_JSON="[]"
+
+        for FILE in $CHANGED_FILES; do
+          if [ ! -f "$FILE" ]; then
+            continue
+          fi
+
+          # Get old and new versions of the file
+          OLD_DEPS=$(git show "$BASE_SHA:$FILE" 2>/dev/null | jq -r '.dependencies // {} | to_entries[] | "\(.key)@\(.value)"' 2>/dev/null || echo "")
+          OLD_DEV=$(git show "$BASE_SHA:$FILE" 2>/dev/null | jq -r '.devDependencies // {} | to_entries[] | "\(.key)@\(.value)"' 2>/dev/null || echo "")
+          NEW_DEPS=$(jq -r '.dependencies // {} | to_entries[] | "\(.key)@\(.value)"' "$FILE" 2>/dev/null || echo "")
+          NEW_DEV=$(jq -r '.devDependencies // {} | to_entries[] | "\(.key)@\(.value)"' "$FILE" 2>/dev/null || echo "")
+
+          # Find new or changed deps (in new but not in old, or version changed)
+          ALL_OLD=$(echo -e "${OLD_DEPS}\n${OLD_DEV}" | sort | grep -v '^$' || true)
+          ALL_NEW=$(echo -e "${NEW_DEPS}\n${NEW_DEV}" | sort | grep -v '^$' || true)
+
+          # Deps that are new or changed
+          CHANGED_DEPS=$(comm -13 <(echo "$ALL_OLD") <(echo "$ALL_NEW") 2>/dev/null || echo "")
+
+          if [ -n "$CHANGED_DEPS" ]; then
+            while IFS= read -r dep; do
+              PKG_NAME=$(echo "$dep" | sed 's/@[^^]*$//' | sed 's/^\(.*\)@.*$/\1/')
+              # Handle scoped packages
+              if [[ "$dep" == @* ]]; then
+                PKG_NAME=$(echo "$dep" | sed 's/\(^@[^/]*\/[^@]*\)@.*/\1/')
+              else
+                PKG_NAME=$(echo "$dep" | sed 's/@[^@]*$//')
+              fi
+              DEPS_JSON=$(echo "$DEPS_JSON" | jq --arg pkg "$PKG_NAME" '. + [$pkg]' 2>/dev/null)
+            done <<< "$CHANGED_DEPS"
+          fi
+        done
+
+        # Deduplicate
+        DEPS_JSON=$(echo "$DEPS_JSON" | jq 'unique')
+        COUNT=$(echo "$DEPS_JSON" | jq 'length')
+
+        echo "Found $COUNT changed/new dependencies"
+        echo "$DEPS_JSON" > /tmp/depintel-changed-deps.json
+        echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+        echo "::endgroup::"
+
+    - name: Analyze dependencies
+      id: analyze
+      if: steps.detect.outputs.changed == 'true' && steps.detect.outputs.count != '0'
+      shell: bash
+      env:
+        API_URL: ${{ inputs.api-url }}
+      run: |
+        echo "::group::Analyzing dependencies via DepIntel API"
+
+        DEPS=$(cat /tmp/depintel-changed-deps.json)
+        COUNT=$(echo "$DEPS" | jq 'length')
+
+        TOTAL_VULNS=0
+        REPORT='{"dependencies":[],"summary":{"total":0,"vulnerabilities":0,"high_risk_licenses":0}}'
+
+        for i in $(seq 0 $((COUNT - 1))); do
+          PKG=$(echo "$DEPS" | jq -r ".[$i]")
+          echo "Analyzing: $PKG"
+
+          # Fetch vulnerability data
+          VULN_DATA=$(curl -sf "${API_URL}/api/vulnerabilities?package=${PKG}" 2>/dev/null || echo '{"count":0,"vulnerabilities":[]}')
+          VULN_COUNT=$(echo "$VULN_DATA" | jq '.count // 0')
+
+          # Fetch license data
+          LICENSE_DATA=$(curl -sf "${API_URL}/api/license?package=${PKG}" 2>/dev/null || echo '{"license":"unknown","risk":"unknown"}')
+          LICENSE=$(echo "$LICENSE_DATA" | jq -r '.license // "unknown"')
+          RISK=$(echo "$LICENSE_DATA" | jq -r '.risk // "unknown"')
+
+          TOTAL_VULNS=$((TOTAL_VULNS + VULN_COUNT))
+
+          # Track high-risk licenses
+          HIGH_RISK=0
+          if [ "$RISK" = "high" ] || [ "$RISK" = "critical" ]; then
+            HIGH_RISK=1
+          fi
+
+          # Build dep entry
+          DEP_ENTRY=$(jq -n \
+            --arg pkg "$PKG" \
+            --arg license "$LICENSE" \
+            --arg risk "$RISK" \
+            --argjson vulns "$VULN_COUNT" \
+            --argjson vuln_data "$VULN_DATA" \
+            --argjson license_data "$LICENSE_DATA" \
+            '{package: $pkg, license: $license, license_risk: $risk, vulnerability_count: $vulns, vulnerabilities: $vuln_data.vulnerabilities, license_details: $license_data}')
+
+          REPORT=$(echo "$REPORT" | jq \
+            --argjson dep "$DEP_ENTRY" \
+            --argjson hr "$HIGH_RISK" \
+            '.dependencies += [$dep] | .summary.total += 1 | .summary.vulnerabilities += ($dep.vulnerability_count) | .summary.high_risk_licenses += $hr')
+
+          # Rate limit courtesy
+          sleep 0.2
+        done
+
+        echo "$REPORT" > /tmp/depintel-report.json
+        echo "vulns=$TOTAL_VULNS" >> "$GITHUB_OUTPUT"
+        echo "report=/tmp/depintel-report.json" >> "$GITHUB_OUTPUT"
+
+        echo "Total vulnerabilities found: $TOTAL_VULNS"
+        echo "::endgroup::"
+
+    - name: Post PR comment
+      if: steps.detect.outputs.changed == 'true' && steps.detect.outputs.count != '0' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        REPORT=$(cat /tmp/depintel-report.json)
+        TOTAL=$(echo "$REPORT" | jq '.summary.total')
+        VULNS=$(echo "$REPORT" | jq '.summary.vulnerabilities')
+        HIGH_RISK=$(echo "$REPORT" | jq '.summary.high_risk_licenses')
+
+        # Build markdown comment
+        COMMENT="## :shield: DepIntel — Dependency Analysis\n\n"
+        COMMENT+="| Metric | Value |\n|--------|-------|\n"
+        COMMENT+="| Dependencies analyzed | **${TOTAL}** |\n"
+        COMMENT+="| Vulnerabilities found | **${VULNS}** |\n"
+        COMMENT+="| High-risk licenses | **${HIGH_RISK}** |\n\n"
+
+        # Per-dependency details
+        DEP_COUNT=$(echo "$REPORT" | jq '.dependencies | length')
+
+        if [ "$DEP_COUNT" -gt 0 ]; then
+          COMMENT+="### Details\n\n"
+          COMMENT+="| Package | License | Risk | Vulnerabilities |\n"
+          COMMENT+="|---------|---------|------|-----------------|\n"
+
+          for i in $(seq 0 $((DEP_COUNT - 1))); do
+            DEP=$(echo "$REPORT" | jq ".dependencies[$i]")
+            PKG=$(echo "$DEP" | jq -r '.package')
+            LIC=$(echo "$DEP" | jq -r '.license')
+            RISK=$(echo "$DEP" | jq -r '.license_risk')
+            VC=$(echo "$DEP" | jq '.vulnerability_count')
+
+            # Risk emoji
+            case "$RISK" in
+              low) RISK_ICON=":white_check_mark: low" ;;
+              medium) RISK_ICON=":yellow_circle: medium" ;;
+              high|critical) RISK_ICON=":red_circle: $RISK" ;;
+              *) RISK_ICON=":grey_question: $RISK" ;;
+            esac
+
+            # Vuln emoji
+            if [ "$VC" -eq 0 ]; then
+              VULN_ICON=":white_check_mark: 0"
+            else
+              VULN_ICON=":warning: ${VC}"
+            fi
+
+            COMMENT+="| \`${PKG}\` | ${LIC} | ${RISK_ICON} | ${VULN_ICON} |\n"
+          done
+
+          # Vulnerability details (if any)
+          if [ "$VULNS" -gt 0 ]; then
+            COMMENT+="\n<details>\n<summary>:warning: Vulnerability Details</summary>\n\n"
+
+            for i in $(seq 0 $((DEP_COUNT - 1))); do
+              DEP=$(echo "$REPORT" | jq ".dependencies[$i]")
+              PKG=$(echo "$DEP" | jq -r '.package')
+              VC=$(echo "$DEP" | jq '.vulnerability_count')
+
+              if [ "$VC" -gt 0 ]; then
+                COMMENT+="#### \`${PKG}\` — ${VC} vulnerabilities\n\n"
+
+                for j in $(seq 0 $((VC - 1))); do
+                  if [ "$j" -ge 5 ]; then
+                    REMAINING=$((VC - 5))
+                    COMMENT+="*...and ${REMAINING} more*\n\n"
+                    break
+                  fi
+
+                  VULN=$(echo "$DEP" | jq ".vulnerabilities[$j]")
+                  VID=$(echo "$VULN" | jq -r '.id // "unknown"')
+                  VSUMMARY=$(echo "$VULN" | jq -r '.summary // "No summary"')
+                  COMMENT+="- **${VID}**: ${VSUMMARY}\n"
+                done
+                COMMENT+="\n"
+              fi
+            done
+
+            COMMENT+="</details>\n"
+          fi
+        fi
+
+        COMMENT+="\n---\n*Powered by [DepIntel](https://depintel-api.pingbase-api.workers.dev) | [lunacompsia-oss](https://github.com/lunacompsia-oss)*"
+
+        # Post comment via GitHub API
+        PR_NUMBER=${{ github.event.pull_request.number }}
+
+        # Delete previous DepIntel comments to avoid spam
+        EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" --jq '.[] | select(.body | contains("DepIntel — Dependency Analysis")) | .id' 2>/dev/null || echo "")
+        for CID in $EXISTING; do
+          gh api -X DELETE "repos/${{ github.repository }}/issues/comments/${CID}" 2>/dev/null || true
+        done
+
+        # Post new comment
+        printf '%b' "$COMMENT" | gh pr comment "$PR_NUMBER" --body-file - 2>/dev/null || echo "::warning::Could not post PR comment"
+
+    - name: Fail on critical
+      if: inputs.fail-on-critical == 'true' && steps.analyze.outputs.vulns != '0'
+      shell: bash
+      run: |
+        echo "::error::Found ${{ steps.analyze.outputs.vulns }} vulnerabilities in changed dependencies"
+        exit 1
